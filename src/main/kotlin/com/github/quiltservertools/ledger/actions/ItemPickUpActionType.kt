@@ -1,72 +1,64 @@
 package com.github.quiltservertools.ledger.actions
 
+import com.github.quiltservertools.ledger.utility.LOGGER
 import com.github.quiltservertools.ledger.utility.NbtUtils
 import com.github.quiltservertools.ledger.utility.TextColorPallet
 import com.github.quiltservertools.ledger.utility.UUID
 import com.github.quiltservertools.ledger.utility.getWorld
 import com.github.quiltservertools.ledger.utility.literal
-import net.minecraft.entity.Entity
-import net.minecraft.entity.EntityType
-import net.minecraft.entity.ItemEntity
-import net.minecraft.item.AliasedBlockItem
-import net.minecraft.item.BlockItem
-import net.minecraft.nbt.StringNbtReader
-import net.minecraft.registry.Registries
+import net.minecraft.commands.CommandSourceStack
+import net.minecraft.core.UUIDUtil
+import net.minecraft.nbt.TagParser
+import net.minecraft.network.chat.Component
+import net.minecraft.network.chat.HoverEvent
 import net.minecraft.server.MinecraftServer
-import net.minecraft.server.command.ServerCommandSource
-import net.minecraft.text.HoverEvent
-import net.minecraft.text.Text
-import net.minecraft.util.Util
+import net.minecraft.util.ProblemReporter
+import net.minecraft.world.entity.Entity
+import net.minecraft.world.entity.EntityType
+import net.minecraft.world.entity.item.ItemEntity
+import net.minecraft.world.level.storage.TagValueInput
 
 open class ItemPickUpActionType : AbstractActionType() {
     override val identifier = "item-pick-up"
 
-    override fun getTranslationType(): String {
-        val item = Registries.ITEM.get(objectIdentifier)
-        return if (item is BlockItem && item !is AliasedBlockItem) {
-            "block"
-        } else {
-            "item"
-        }
-    }
+    // Not used
+    override fun getTranslationType(): String = "item"
 
     private fun getStack(server: MinecraftServer) = NbtUtils.itemFromProperties(
         extraData,
         objectIdentifier,
-        server.registryManager
+        server.registryAccess()
     )
 
-    override fun getObjectMessage(source: ServerCommandSource): Text {
+    override fun getObjectMessage(source: CommandSourceStack): Component {
         val stack = getStack(source.server)
 
         return "${stack.count} ".literal().append(
-            Text.translatable(
-                Util.createTranslationKey(
-                    getTranslationType(),
-                    objectIdentifier
-                )
-            )
-        ).setStyle(TextColorPallet.secondaryVariant).styled {
+            stack.itemName
+        ).setStyle(TextColorPallet.secondaryVariant).withStyle {
             it.withHoverEvent(
-                HoverEvent(
-                    HoverEvent.Action.SHOW_ITEM,
-                    HoverEvent.ItemStackContent(stack)
+                HoverEvent.ShowItem(
+                    stack
                 )
             )
         }
     }
 
     override fun rollback(server: MinecraftServer): Boolean {
-        val world = server.getWorld(world)
+        val world = server.getWorld(world)!!
 
-        val oldEntity = StringNbtReader.parse(oldObjectState)
-        val uuid = oldEntity!!.getUuid(UUID) ?: return false
-        val entity = world?.getEntity(uuid)
+        val oldEntity = TagParser.parseCompoundFully(oldObjectState!!)
+        val optionalUUID = oldEntity.read(UUID, UUIDUtil.CODEC)
+        if (optionalUUID.isEmpty) return false
+        val entity = world.getEntity(optionalUUID.get())
 
         if (entity == null) {
             val entity = ItemEntity(EntityType.ITEM, world)
-            entity.readNbt(oldEntity)
-            world?.spawnEntity(entity)
+            ProblemReporter.ScopedCollector({ "ledger:rollback:item-pick-up@$pos" }, LOGGER).use {
+                val readView = TagValueInput.create(it, world.registryAccess(), oldEntity)
+                entity.load(readView)
+                world.addFreshEntity(entity)
+            }
         }
         return true
     }
@@ -74,9 +66,10 @@ open class ItemPickUpActionType : AbstractActionType() {
     override fun restore(server: MinecraftServer): Boolean {
         val world = server.getWorld(world)
 
-        val oldEntity = StringNbtReader.parse(oldObjectState)
-        val uuid = oldEntity!!.getUuid(UUID) ?: return false
-        val entity = world?.getEntity(uuid)
+        val oldEntity = TagParser.parseCompoundFully(oldObjectState!!)
+        val optionalUUID = oldEntity.read(UUID, UUIDUtil.CODEC)
+        if (optionalUUID.isEmpty) return false
+        val entity = world?.getEntity(optionalUUID.get())
 
         if (entity != null) {
             entity.remove(Entity.RemovalReason.DISCARDED)

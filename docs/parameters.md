@@ -37,14 +37,12 @@ An identifier is Minecraft's ID system of a namespace and a path divided by `:`.
 
 ## Range
 Key - `range:`  
-Value - `Integer > 1`  
+Value - `Integer > 1` | `@global`  
 Negative Allowed - `No`  
 Multiple Allowed - `No`  
-Example - `range:5`
+Example - `range:5`, `range:@global`
 
 This parameter allows you to filter your selection based on your location.
-This will not filter by your dimension, so you may still get results from other worlds.
-Use the [dimension parameter](#dimension) to filter by world.
 
 ## Source
 Key - `source:`  

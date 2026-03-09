@@ -20,12 +20,13 @@ import com.mojang.brigadier.exceptions.CommandSyntaxException
 import com.mojang.brigadier.exceptions.SimpleCommandExceptionType
 import com.mojang.brigadier.suggestion.Suggestions
 import com.mojang.brigadier.suggestion.SuggestionsBuilder
-import net.minecraft.server.command.CommandManager
-import net.minecraft.server.command.ServerCommandSource
-import net.minecraft.util.Identifier
-import net.minecraft.util.math.BlockBox
-import net.minecraft.util.math.BlockPos
-import net.minecraft.util.math.Vec3i
+import net.minecraft.commands.CommandSourceStack
+import net.minecraft.commands.Commands
+import net.minecraft.core.BlockPos
+import net.minecraft.core.Vec3i
+import net.minecraft.network.chat.Component
+import net.minecraft.resources.Identifier
+import net.minecraft.world.level.levelgen.structure.BoundingBox
 import java.time.Instant
 import java.util.*
 import java.util.concurrent.CompletableFuture
@@ -44,8 +45,8 @@ object SearchParamArgument {
         paramSuggesters["rolledback"] = Parameter(RollbackStatusParameter())
     }
 
-    fun argument(name: String): RequiredArgumentBuilder<ServerCommandSource, String> {
-        return CommandManager.argument(name, StringArgumentType.greedyString())
+    fun argument(name: String): RequiredArgumentBuilder<CommandSourceStack, String> {
+        return Commands.argument(name, StringArgumentType.greedyString())
             .suggests { context, builder ->
                 val input = builder.input
                 val lastSpaceIndex = input.lastIndexOf(' ')
@@ -85,9 +86,9 @@ object SearchParamArgument {
     }
 
     @Suppress("UNCHECKED_CAST")
-    fun get(input: String, source: ServerCommandSource): ActionSearchParams {
+    fun get(input: String, source: CommandSourceStack): ActionSearchParams {
         val reader = StringReader(input)
-        val result = HashMultimap.create<String, Any>()
+        val result = HashMultimap.create<String, Any?>()
         while (reader.canRead()) {
             val propertyName = reader.readStringUntil(':').trim(' ')
             val parameter = paramSuggesters[propertyName]
@@ -106,13 +107,24 @@ object SearchParamArgument {
 
             when (param) {
                 "range" -> {
-                    val range = value as Int - 1
-                    builder.bounds = BlockBox.create(
-                        BlockPos.ofFloored(source.position).subtract(Vec3i(range, range, range)),
-                        BlockPos.ofFloored(source.position).add(Vec3i(range, range, range))
-                    )
-                    val world = Negatable.allow(source.world.registryKey.value)
-                    if (builder.worlds == null) builder.worlds = mutableSetOf(world) else builder.worlds!!.add(world)
+                    val range = value as Int?
+                    if (range != null) {
+                        val range = range - 1
+                        builder.bounds = BoundingBox.fromCorners(
+                            BlockPos.containing(source.position).subtract(Vec3i(range, range, range)),
+                            BlockPos.containing(source.position).offset(Vec3i(range, range, range))
+                        )
+                        val world = Negatable.allow(source.level.dimension().identifier())
+                        if (builder.worlds == null) {
+                            builder.worlds = mutableSetOf(world)
+                        } else {
+                            builder.worlds!!.add(
+                            world
+                        )
+                        }
+                    } else {
+                        builder.bounds = ActionSearchParams.GLOBAL
+                    }
                 }
                 "world" -> {
                     val world = value as Negatable<Identifier>
@@ -140,7 +152,7 @@ object SearchParamArgument {
                             builder.sourceNames!!.add(nonPlayer)
                         }
                     } else {
-                        val profile = source.server.userCache?.findByName(sourceInput.property)
+                        val profile = source.server.services().nameToIdCache?.get(sourceInput.property)
                         // If the player doesn't exist use a random UUID to make the query not match
                         val id = profile?.orElse(null)?.id ?: UUID.randomUUID()
 
@@ -181,7 +193,7 @@ object SearchParamArgument {
         return builder.build()
     }
 
-    fun get(context: CommandContext<ServerCommandSource>, name: String): ActionSearchParams {
+    fun get(context: CommandContext<CommandSourceStack>, name: String): ActionSearchParams {
         val input = StringArgumentType.getString(context, name)
         return get(input, context.source)
     }
@@ -190,7 +202,7 @@ object SearchParamArgument {
         val input = builder.remaining.lowercase()
         for (param in paramSuggesters.keys) {
             if (param.startsWith(input)) {
-                builder.suggest("$param:")
+                builder.suggest("$param:", Component.translatable("text.ledger.parameter.$param.description"))
             }
         }
         return builder
@@ -199,7 +211,7 @@ object SearchParamArgument {
     private open class Parameter<T>(private val parameter: SimpleParameter<T>) {
 
         open fun listSuggestions(
-            context: CommandContext<ServerCommandSource>,
+            context: CommandContext<CommandSourceStack>,
             builder: SuggestionsBuilder
         ): CompletableFuture<Suggestions> {
             return try {
@@ -210,9 +222,13 @@ object SearchParamArgument {
         }
 
         open fun getRemaining(s: String): Int {
-            val reader = StringReader(s)
-            parameter.parse(reader)
-            return reader.remainingLength
+            try {
+                val reader = StringReader(s)
+                parameter.parse(reader)
+                return reader.remainingLength
+            } catch (_: CommandSyntaxException) {
+                return 0
+            }
         }
 
         @Throws(CommandSyntaxException::class)
@@ -221,7 +237,7 @@ object SearchParamArgument {
 
     private class NegatableParameter<T>(parameter: SimpleParameter<T>) : Parameter<T>(parameter) {
         override fun listSuggestions(
-            context: CommandContext<ServerCommandSource>,
+            context: CommandContext<CommandSourceStack>,
             builder: SuggestionsBuilder
         ): CompletableFuture<Suggestions> {
             val builder = if (builder.remaining.startsWith("!")) builder.createOffset(builder.start + 1) else builder

@@ -2,38 +2,57 @@ package com.github.quiltservertools.ledger.actions
 
 import com.github.quiltservertools.ledger.actionutils.Preview
 import com.github.quiltservertools.ledger.logWarn
+import com.github.quiltservertools.ledger.utility.LOGGER
 import com.github.quiltservertools.ledger.utility.NbtUtils
 import com.github.quiltservertools.ledger.utility.TextColorPallet
 import com.github.quiltservertools.ledger.utility.getWorld
 import com.github.quiltservertools.ledger.utility.literal
-import net.minecraft.block.BlockState
-import net.minecraft.block.Blocks
-import net.minecraft.nbt.StringNbtReader
-import net.minecraft.network.packet.s2c.play.BlockUpdateS2CPacket
-import net.minecraft.registry.Registries
+import net.minecraft.commands.CommandSourceStack
+import net.minecraft.core.HolderGetter
+import net.minecraft.core.registries.BuiltInRegistries
+import net.minecraft.core.registries.Registries
+import net.minecraft.nbt.TagParser
+import net.minecraft.network.chat.Component
+import net.minecraft.network.chat.HoverEvent
+import net.minecraft.network.protocol.game.ClientboundBlockUpdatePacket
+import net.minecraft.resources.Identifier
 import net.minecraft.server.MinecraftServer
-import net.minecraft.server.command.ServerCommandSource
-import net.minecraft.server.network.ServerPlayerEntity
-import net.minecraft.text.HoverEvent
-import net.minecraft.text.Text
-import net.minecraft.util.Identifier
+import net.minecraft.server.level.ServerPlayer
+import net.minecraft.util.ProblemReporter
 import net.minecraft.util.Util
+import net.minecraft.world.level.block.Block
+import net.minecraft.world.level.block.Blocks
+import net.minecraft.world.level.block.state.BlockState
+import net.minecraft.world.level.storage.TagValueInput
 
 open class BlockChangeActionType : AbstractActionType() {
     override val identifier = "block-change"
 
     override fun rollback(server: MinecraftServer): Boolean {
         val world = server.getWorld(world)
-        world?.setBlockState(pos, oldBlockState())
-        world?.getBlockEntity(pos)?.read(StringNbtReader.parse(extraData), server.registryManager)
-        world?.chunkManager?.markForUpdate(pos)
+        world?.setBlockAndUpdate(pos, oldBlockState(world.holderLookup(Registries.BLOCK)))
+        ProblemReporter.ScopedCollector({ "ledger:rollback:block-change@$pos" }, LOGGER).use {
+            world?.getBlockEntity(pos)?.loadWithComponents(
+                TagValueInput.create(
+                    it,
+                    server.registryAccess(),
+                    TagParser.parseCompoundFully(extraData!!)
+                )
+            )
+        }
+        world?.chunkSource?.blockChanged(pos)
 
         return true
     }
 
-    override fun previewRollback(preview: Preview, player: ServerPlayerEntity) {
-        if (player.world.registryKey.value == world) {
-            player.networkHandler.sendPacket(BlockUpdateS2CPacket(pos, oldBlockState()))
+    override fun previewRollback(preview: Preview, player: ServerPlayer) {
+        if (player.level().dimension().identifier() == world) {
+            player.connection.send(
+                ClientboundBlockUpdatePacket(
+                    pos,
+                    oldBlockState(player.level().holderLookup(Registries.BLOCK))
+                )
+            )
             preview.positions.add(pos)
         }
     }
@@ -41,32 +60,36 @@ open class BlockChangeActionType : AbstractActionType() {
     override fun restore(server: MinecraftServer): Boolean {
         val world = server.getWorld(world)
 
-        world?.setBlockState(pos, newBlockState())
+        world?.setBlockAndUpdate(pos, newBlockState(world.holderLookup(Registries.BLOCK)))
 
         return true
     }
 
-    override fun previewRestore(preview: Preview, player: ServerPlayerEntity) {
-        if (player.world.registryKey.value == world) {
-            player.networkHandler.sendPacket(BlockUpdateS2CPacket(pos, newBlockState()))
+    override fun previewRestore(preview: Preview, player: ServerPlayer) {
+        if (player.level().dimension().identifier() == world) {
+            player.connection.send(
+                ClientboundBlockUpdatePacket(
+                    pos,
+                    newBlockState(player.level().holderLookup(Registries.BLOCK))
+                )
+            )
             preview.positions.add(pos)
         }
     }
 
     override fun getTranslationType() = "block"
 
-    override fun getObjectMessage(source: ServerCommandSource): Text {
-        val text = Text.literal("")
+    override fun getObjectMessage(source: CommandSourceStack): Component {
+        val text = Component.literal("")
         text.append(
-            Text.translatable(
-            Util.createTranslationKey(
+            Component.translatable(
+            Util.makeDescriptionId(
                 this.getTranslationType(),
                 oldObjectIdentifier
             )
-        ).setStyle(TextColorPallet.secondaryVariant).styled {
+        ).setStyle(TextColorPallet.secondaryVariant).withStyle {
             it.withHoverEvent(
-                HoverEvent(
-                    HoverEvent.Action.SHOW_TEXT,
+                HoverEvent.ShowText(
                     oldObjectIdentifier.toString().literal()
                 )
             )
@@ -75,15 +98,14 @@ open class BlockChangeActionType : AbstractActionType() {
         if (oldObjectIdentifier != objectIdentifier) {
             text.append(" → ".literal())
             text.append(
-                Text.translatable(
-                    Util.createTranslationKey(
+                Component.translatable(
+                    Util.makeDescriptionId(
                         this.getTranslationType(),
                         objectIdentifier
                     )
-                ).setStyle(TextColorPallet.secondaryVariant).styled {
+                ).setStyle(TextColorPallet.secondaryVariant).withStyle {
                     it.withHoverEvent(
-                        HoverEvent(
-                            HoverEvent.Action.SHOW_TEXT,
+                        HoverEvent.ShowText(
                             objectIdentifier.toString().literal()
                         )
                     )
@@ -93,34 +115,36 @@ open class BlockChangeActionType : AbstractActionType() {
         return text
     }
 
-    fun oldBlockState() = checkForBlockState(
+    fun oldBlockState(blockLookup: HolderGetter<Block>) = checkForBlockState(
         oldObjectIdentifier,
         oldObjectState?.let {
-        NbtUtils.blockStateFromProperties(
-            StringNbtReader.parse(it),
-            oldObjectIdentifier
-        )
-    }
+            NbtUtils.blockStateFromProperties(
+                TagParser.parseCompoundFully(it),
+                oldObjectIdentifier,
+                blockLookup
+            )
+        }
     )
 
-    fun newBlockState() = checkForBlockState(
+    fun newBlockState(blockLookup: HolderGetter<Block>) = checkForBlockState(
         objectIdentifier,
         objectState?.let {
-        NbtUtils.blockStateFromProperties(
-            StringNbtReader.parse(it),
-            objectIdentifier
-        )
-    }
+            NbtUtils.blockStateFromProperties(
+                TagParser.parseCompoundFully(it),
+                objectIdentifier,
+                blockLookup
+            )
+        }
     )
 
     private fun checkForBlockState(identifier: Identifier, checkState: BlockState?): BlockState {
-        val block = Registries.BLOCK.getOrEmpty(identifier)
+        val block = BuiltInRegistries.BLOCK.getOptional(identifier)
         if (block.isEmpty) {
             logWarn("Unknown block $identifier")
-            return Blocks.AIR.defaultState
+            return Blocks.AIR.defaultBlockState()
         }
 
-        var state = block.get().defaultState
+        var state = block.get().defaultBlockState()
         if (checkState != null) state = checkState
 
         return state

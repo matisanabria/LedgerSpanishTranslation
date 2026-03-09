@@ -1,68 +1,86 @@
 package com.github.quiltservertools.ledger.actions
 
+import com.github.quiltservertools.ledger.utility.LOGGER
 import com.github.quiltservertools.ledger.utility.TextColorPallet
 import com.github.quiltservertools.ledger.utility.UUID
 import com.github.quiltservertools.ledger.utility.getWorld
 import com.github.quiltservertools.ledger.utility.literal
-import net.minecraft.entity.LivingEntity
-import net.minecraft.entity.decoration.AbstractDecorationEntity
-import net.minecraft.entity.decoration.ItemFrameEntity
-import net.minecraft.item.AliasedBlockItem
-import net.minecraft.item.BlockItem
-import net.minecraft.item.ItemStack
-import net.minecraft.nbt.StringNbtReader
-import net.minecraft.registry.Registries
+import com.mojang.brigadier.exceptions.CommandSyntaxException
+import net.minecraft.commands.CommandSourceStack
+import net.minecraft.core.RegistryAccess
+import net.minecraft.core.UUIDUtil
+import net.minecraft.core.registries.BuiltInRegistries
+import net.minecraft.nbt.TagParser
+import net.minecraft.network.chat.Component
+import net.minecraft.network.chat.HoverEvent
+import net.minecraft.resources.Identifier
 import net.minecraft.server.MinecraftServer
-import net.minecraft.server.command.ServerCommandSource
-import net.minecraft.text.HoverEvent
-import net.minecraft.text.Text
-import net.minecraft.util.Identifier
+import net.minecraft.util.ProblemReporter
 import net.minecraft.util.Util
+import net.minecraft.world.entity.LivingEntity
+import net.minecraft.world.entity.decoration.HangingEntity
+import net.minecraft.world.entity.decoration.ItemFrame
+import net.minecraft.world.item.BlockItem
+import net.minecraft.world.item.ItemStack
+import net.minecraft.world.level.storage.TagValueInput
 
 class EntityChangeActionType : AbstractActionType() {
     override val identifier = "entity-change"
 
     override fun getTranslationType(): String {
-        val item = Registries.ITEM.get(Identifier.of(extraData))
-        return if (item is BlockItem && item !is AliasedBlockItem) {
+        val item = getStack(RegistryAccess.EMPTY).item
+        return if (item is BlockItem) {
             "block"
         } else {
             "item"
         }
     }
 
-    override fun getObjectMessage(source: ServerCommandSource): Text {
-        val text = Text.literal("")
+    private fun getStack(registryManager: RegistryAccess): ItemStack {
+        if (extraData == null) return ItemStack.EMPTY
+        try {
+            val readView = TagValueInput.create(
+                ProblemReporter.DISCARDING,
+                registryManager,
+                TagParser.parseCompoundFully(extraData!!)
+            )
+            return readView.read(ItemStack.MAP_CODEC).orElse(ItemStack.EMPTY)
+        } catch (_: CommandSyntaxException) {
+            // In an earlier version of ledger extraData only stored the item id
+            val item = BuiltInRegistries.ITEM.getValue(Identifier.parse(extraData!!))
+            return item.defaultInstance
+        }
+    }
+
+    override fun getObjectMessage(source: CommandSourceStack): Component {
+        val text = Component.literal("")
         text.append(
-            Text.translatable(
-                Util.createTranslationKey(
+            Component.translatable(
+                Util.makeDescriptionId(
                     "entity",
                     objectIdentifier
                 )
-            ).setStyle(TextColorPallet.secondaryVariant).styled {
+            ).setStyle(TextColorPallet.secondaryVariant).withStyle {
                 it.withHoverEvent(
-                    HoverEvent(
-                        HoverEvent.Action.SHOW_TEXT,
+                    HoverEvent.ShowText(
                         objectIdentifier.toString().literal()
                     )
                 )
             }
         )
 
-        if (extraData != null && Identifier.of(extraData) != Identifier.tryParse("minecraft:air")) {
-            val stack = ItemStack(Registries.ITEM.get(Identifier.of(extraData)))
-            text.append(Text.literal(" ").append(Text.translatable("text.ledger.action_message.with")).append(" "))
+        val stack = getStack(source.registryAccess())
+        if (!stack.isEmpty) {
             text.append(
-                Text.translatable(
-                    Util.createTranslationKey(
-                        this.getTranslationType(),
-                        Identifier.of(extraData)
-                    )
-                ).setStyle(TextColorPallet.secondaryVariant).styled {
+                Component.literal(" ").append(Component.translatable("text.ledger.action_message.with")).append(" ")
+            )
+            text.append(
+                Component.translatable(
+                    stack.item.descriptionId
+                ).setStyle(TextColorPallet.secondaryVariant).withStyle {
                     it.withHoverEvent(
-                        HoverEvent(
-                            HoverEvent.Action.SHOW_ITEM,
-                            HoverEvent.ItemStackContent(stack)
+                        HoverEvent.ShowItem(
+                            stack
                         )
                     )
                 }
@@ -74,17 +92,21 @@ class EntityChangeActionType : AbstractActionType() {
     override fun rollback(server: MinecraftServer): Boolean {
         val world = server.getWorld(world)
 
-        val oldEntity = StringNbtReader.parse(oldObjectState)
-        val uuid = oldEntity!!.getUuid(UUID) ?: return false
-        val entity = world?.getEntity(uuid)
+        val oldEntity = TagParser.parseCompoundFully(oldObjectState!!)
+        val optionalUUID = oldEntity.read(UUID, UUIDUtil.CODEC)
+        if (optionalUUID.isEmpty) return false
+        val entity = world?.getEntity(optionalUUID.get())
 
         if (entity != null) {
-            if (entity is ItemFrameEntity) {
-                entity.heldItemStack = ItemStack.EMPTY
-            }
-            when (entity) {
-                is LivingEntity -> entity.readCustomDataFromNbt(oldEntity)
-                is AbstractDecorationEntity -> entity.readCustomDataFromNbt(oldEntity)
+            ProblemReporter.ScopedCollector({ "ledger:rollback:entity-change@$pos" }, LOGGER).use {
+                val readView = TagValueInput.create(it, server.registryAccess(), oldEntity)
+                if (entity is ItemFrame) {
+                    entity.item = ItemStack.EMPTY
+                }
+                when (entity) {
+                    is LivingEntity -> entity.load(readView)
+                    is HangingEntity -> entity.load(readView)
+                }
             }
             return true
         }
@@ -93,17 +115,21 @@ class EntityChangeActionType : AbstractActionType() {
 
     override fun restore(server: MinecraftServer): Boolean {
         val world = server.getWorld(world)
-        val newEntity = StringNbtReader.parse(objectState)
-        val uuid = newEntity!!.getUuid(UUID) ?: return false
-        val entity = world?.getEntity(uuid)
+        val newEntity = TagParser.parseCompoundFully(objectState!!)
+        val optionalUUID = newEntity.read(UUID, UUIDUtil.CODEC)
+        if (optionalUUID.isEmpty) return false
+        val entity = world?.getEntity(optionalUUID.get())
 
         if (entity != null) {
-            if (entity is ItemFrameEntity) {
-                entity.heldItemStack = ItemStack.EMPTY
-            }
-            when (entity) {
-                is LivingEntity -> entity.readCustomDataFromNbt(newEntity)
-                is AbstractDecorationEntity -> entity.readCustomDataFromNbt(newEntity)
+            ProblemReporter.ScopedCollector({ "ledger:restore:entity-change@$pos" }, LOGGER).use {
+                val readView = TagValueInput.create(it, server.registryAccess(), newEntity)
+                if (entity is ItemFrame) {
+                    entity.item = ItemStack.EMPTY
+                }
+                when (entity) {
+                    is LivingEntity -> entity.load(readView)
+                    is HangingEntity -> entity.load(readView)
+                }
             }
             return true
         }

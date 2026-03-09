@@ -20,6 +20,7 @@ import com.github.quiltservertools.ledger.network.packet.handshake.HandshakeS2CP
 import com.github.quiltservertools.ledger.network.packet.response.ResponseS2CPacket
 import com.github.quiltservertools.ledger.registry.ActionRegistry
 import com.uchuhimo.konf.Config
+import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
@@ -32,12 +33,12 @@ import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry
 import net.fabricmc.loader.api.FabricLoader
-import net.minecraft.registry.Registries
+import net.minecraft.core.registries.BuiltInRegistries
+import net.minecraft.resources.Identifier
 import net.minecraft.server.MinecraftServer
-import net.minecraft.util.Identifier
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
-import org.jetbrains.exposed.sql.vendors.SQLiteDialect
+import org.jetbrains.exposed.v1.core.vendors.SQLiteDialect
 import java.nio.file.Files
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
@@ -61,7 +62,7 @@ object Ledger : DedicatedServerModInitializer, CoroutineScope {
     @JvmField // Required for mixin access
     val previewCache = ConcurrentHashMap<UUID, Preview>()
 
-    override val coroutineContext: CoroutineContext = Dispatchers.IO
+    override val coroutineContext: CoroutineContext = Dispatchers.Default + CoroutineName("Ledger")
 
     override fun onInitializeServer() {
         val version = FabricLoader.getInstance().getModContainer(MOD_ID).get().metadata.version
@@ -70,7 +71,7 @@ object Ledger : DedicatedServerModInitializer, CoroutineScope {
         if (!Files.exists(FabricLoader.getInstance().configDir.resolve(CONFIG_PATH))) {
             logInfo("No config file, Creating")
             Files.copy(
-                FabricLoader.getInstance().getModContainer(MOD_ID).get().getPath(CONFIG_PATH),
+                FabricLoader.getInstance().getModContainer(MOD_ID).get().findPath(CONFIG_PATH).get(),
                 FabricLoader.getInstance().configDir.resolve(CONFIG_PATH)
             )
         }
@@ -97,9 +98,9 @@ object Ledger : DedicatedServerModInitializer, CoroutineScope {
 
         Ledger.launch {
             val idSet = setOf<Identifier>()
-                .plus(Registries.BLOCK.ids)
-                .plus(Registries.ITEM.ids)
-                .plus(Registries.ENTITY_TYPE.ids)
+                .plus(BuiltInRegistries.BLOCK.keySet())
+                .plus(BuiltInRegistries.ITEM.keySet())
+                .plus(BuiltInRegistries.ENTITY_TYPE.keySet())
 
             logInfo("Inserting ${idSet.size} registry keys into the database...")
             DatabaseManager.insertIdentifiers(idSet)
@@ -116,7 +117,7 @@ object Ledger : DedicatedServerModInitializer, CoroutineScope {
         runBlocking {
             try {
                 withTimeout(config[DatabaseSpec.queueTimeoutMin].minutes) {
-                    Ledger.launch(Dispatchers.Default) {
+                    Ledger.launch {
                         while (ActionQueueService.size > 0) {
                             logInfo(
                                 "Database is still busy. If you exit now data WILL be lost. " +
@@ -144,7 +145,7 @@ object Ledger : DedicatedServerModInitializer, CoroutineScope {
         registerEntityListeners()
     }
 
-    fun identifier(path: String) = Identifier.of(MOD_ID, path)
+    fun identifier(path: String) = Identifier.fromNamespaceAndPath(MOD_ID, path)
 }
 
 fun logDebug(message: String) = Ledger.logger.debug(message)
